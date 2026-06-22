@@ -48,6 +48,10 @@
           <span class="stat-label">告警</span>
           <span class="stat-value">{{ alertCount }}</span>
         </div>
+        <div class="stat-item faulty">
+          <span class="stat-label">故障</span>
+          <span class="stat-value">{{ faultCount }}</span>
+        </div>
         <div class="stat-item">
           <span class="stat-label">更新频率</span>
           <span class="stat-value">2s</span>
@@ -65,6 +69,7 @@
           @sensor-click="onSensorClick"
           @connection-status="onConnectionStatus"
           @alert-count="onAlertCount"
+          @fault-count="onFaultCount"
         />
       </div>
       <div class="right-panel">
@@ -106,6 +111,7 @@ const selectedArea = ref('all')
 const windowSeconds = ref(60)
 const selectedSensor = ref('')
 const alertCount = ref(0)
+const faultCount = ref(0)
 
 const totalSensors = computed(() => {
   if (!sensors.value) return 0
@@ -201,6 +207,10 @@ function onConnectionStatus(status) {
 
 function onAlertCount(count) {
   alertCount.value = count
+}
+
+function onFaultCount(count) {
+  faultCount.value = count
 }
 
 let timeInterval
@@ -373,6 +383,11 @@ onUnmounted(() => {
   border-color: #f85149;
 }
 
+.stat-item.faulty {
+  background: rgba(139, 148, 158, 0.1);
+  border-color: #8b949e;
+}
+
 .stat-label {
   font-size: 11px;
   color: #8b949e;
@@ -383,6 +398,10 @@ onUnmounted(() => {
   color: #f85149;
 }
 
+.stat-item.faulty .stat-label {
+  color: #8b949e;
+}
+
 .stat-value {
   font-size: 20px;
   font-weight: 700;
@@ -391,6 +410,16 @@ onUnmounted(() => {
 
 .stat-item.alert .stat-value {
   color: #f85149;
+}
+
+.stat-item.faulty .stat-value {
+  color: #8b949e;
+  animation: blinkStat 1.5s infinite;
+}
+
+@keyframes blinkStat {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 .main-content {

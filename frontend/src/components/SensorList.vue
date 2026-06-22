@@ -15,6 +15,13 @@
           全部
         </button>
         <button
+          @click="filterStatus = 'fault'"
+          :class="{ active: filterStatus === 'fault' }"
+          class="fault-btn"
+        >
+          故障
+        </button>
+        <button
           @click="filterStatus = 'alert'"
           :class="{ active: filterStatus === 'alert' }"
         >
@@ -37,7 +44,9 @@
         :class="{
           active: selectedSensor === sensor.sensor_id && selectedGas === sensor.gas_type,
           alert: isSensorAlert(sensor),
-          warning: isSensorWarning(sensor)
+          warning: isSensorWarning(sensor),
+          faulty: isSensorFaulty(sensor),
+          stale: isSensorStale(sensor)
         }"
         @click="$emit('select', sensor)"
       >
@@ -51,7 +60,15 @@
             <span class="area">{{ sensor.area }}</span>
             <span class="coord">({{ sensor.x }}, {{ sensor.y }})</span>
           </div>
-          <div class="concentration" v-if="getConcentration(sensor) !== null">
+          <div class="concentration" v-if="isSensorFaulty(sensor)">
+            <span class="value faulty">故障</span>
+            <span class="fault-hint">数据不可信</span>
+          </div>
+          <div class="concentration" v-else-if="isSensorStale(sensor)">
+            <span class="value stale">断连</span>
+            <span class="stale-hint">数据过期</span>
+          </div>
+          <div class="concentration" v-else-if="getConcentration(sensor) !== null">
             <span class="value" :class="{ alert: isSensorAlert(sensor) }">
               {{ getConcentration(sensor).toFixed(3) }}
             </span>
@@ -69,6 +86,10 @@
             :style="{ width: getProgressPercent(sensor) + '%' }"
             :class="getProgressClass(sensor)"
           ></div>
+        </div>
+        <div v-if="isSensorFaulty(sensor) || isSensorStale(sensor)" class="fault-badge">
+          <span class="fault-icon">⚠</span>
+          {{ isSensorFaulty(sensor) ? '硬件故障' : '通讯中断' }}
         </div>
       </div>
     </div>
@@ -92,7 +113,7 @@ defineEmits(['select'])
 
 const searchQuery = ref('')
 const filterStatus = ref('all')
-const concentrations = ref({})
+const sensorData = ref({})
 const gridRef = ref(null)
 
 let eventSource = null
@@ -108,45 +129,69 @@ const filteredSensors = computed(() => {
     )
   }
   
-  if (filterStatus.value === 'alert') {
-    result = result.filter(s => isSensorAlert(s))
+  if (filterStatus.value === 'fault') {
+    result = result.filter(s => isSensorFaulty(s) || isSensorStale(s))
+  } else if (filterStatus.value === 'alert') {
+    result = result.filter(s => isSensorAlert(s) && !isSensorFaulty(s) && !isSensorStale(s))
   } else if (filterStatus.value === 'normal') {
-    result = result.filter(s => !isSensorAlert(s) && !isSensorWarning(s))
+    result = result.filter(s => !isSensorAlert(s) && !isSensorWarning(s) && !isSensorFaulty(s) && !isSensorStale(s))
   }
   
   return result
 })
 
-function getConcentration(sensor) {
+function getSensorData(sensor) {
   const key = `${sensor.sensor_id}-${sensor.gas_type}`
-  return concentrations.value[key] !== undefined ? concentrations.value[key] : null
+  return sensorData.value[key] || null
+}
+
+function getConcentration(sensor) {
+  const data = getSensorData(sensor)
+  return data ? data.value : null
+}
+
+function isSensorFaulty(sensor) {
+  const data = getSensorData(sensor)
+  return data && data.health_status === 'faulty'
+}
+
+function isSensorStale(sensor) {
+  const data = getSensorData(sensor)
+  return data && data.health_status === 'stale'
 }
 
 function isSensorAlert(sensor) {
   const conc = getConcentration(sensor)
   if (conc === null) return false
+  if (isSensorFaulty(sensor) || isSensorStale(sensor)) return false
   return conc > sensor.threshold
 }
 
 function isSensorWarning(sensor) {
   const conc = getConcentration(sensor)
   if (conc === null) return false
+  if (isSensorFaulty(sensor) || isSensorStale(sensor)) return false
   return conc > sensor.threshold * 0.7 && conc <= sensor.threshold
 }
 
 function getStatusClass(sensor) {
+  if (isSensorFaulty(sensor)) return 'faulty'
+  if (isSensorStale(sensor)) return 'stale'
   if (isSensorAlert(sensor)) return 'alert'
   if (isSensorWarning(sensor)) return 'warning'
   return 'normal'
 }
 
 function getProgressPercent(sensor) {
+  if (isSensorFaulty(sensor) || isSensorStale(sensor)) return 100
   const conc = getConcentration(sensor)
   if (conc === null) return 0
   return Math.min((conc / sensor.threshold) * 100, 100)
 }
 
 function getProgressClass(sensor) {
+  if (isSensorFaulty(sensor)) return 'faulty'
+  if (isSensorStale(sensor)) return 'stale'
   if (isSensorAlert(sensor)) return 'alert'
   if (isSensorWarning(sensor)) return 'warning'
   return 'normal'
@@ -164,12 +209,12 @@ function connectSSE() {
     try {
       const data = JSON.parse(event.data)
       if (data.type === 'heatmap_update') {
-        const newConc = {}
+        const newData = {}
         data.data.forEach(d => {
           const key = `${d.sensor_id}-${d.gas_type}`
-          newConc[key] = d.value
+          newData[key] = d
         })
-        concentrations.value = newConc
+        sensorData.value = newData
       }
     } catch (e) {
       console.error('Failed to parse SSE message for sensor list:', e)
@@ -178,7 +223,7 @@ function connectSSE() {
 }
 
 watch(() => props.selectedGas, () => {
-  concentrations.value = {}
+  sensorData.value = {}
   connectSSE()
 })
 
@@ -254,6 +299,17 @@ onUnmounted(() => {
   color: #58a6ff;
 }
 
+.filter-btns button.fault-btn:hover {
+  border-color: #f85149;
+  color: #f85149;
+}
+
+.filter-btns button.fault-btn.active {
+  background: rgba(248, 81, 73, 0.15);
+  border-color: #f85149;
+  color: #f85149;
+}
+
 .sensor-grid {
   flex: 1;
   overflow-y: auto;
@@ -313,6 +369,29 @@ onUnmounted(() => {
   background: rgba(255, 164, 28, 0.1);
 }
 
+.sensor-card.faulty {
+  border-color: #8b949e;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(139, 148, 158, 0.1),
+    rgba(139, 148, 158, 0.1) 5px,
+    rgba(110, 118, 129, 0.1) 5px,
+    rgba(110, 118, 129, 0.1) 10px
+  );
+  animation: faultPulse 2s infinite;
+}
+
+@keyframes faultPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.sensor-card.stale {
+  border-color: #6e7681;
+  background: rgba(110, 118, 129, 0.15);
+  opacity: 0.6;
+}
+
 .sensor-header {
   display: flex;
   justify-content: space-between;
@@ -341,6 +420,16 @@ onUnmounted(() => {
 
 .status-dot.warning {
   background: #ffa41c;
+}
+
+.status-dot.faulty {
+  background: #8b949e;
+  animation: blink 0.8s infinite;
+}
+
+.status-dot.stale {
+  background: #6e7681;
+  opacity: 0.5;
 }
 
 @keyframes blink {
@@ -373,6 +462,7 @@ onUnmounted(() => {
   display: flex;
   align-items: baseline;
   gap: 2px;
+  flex-wrap: wrap;
 }
 
 .concentration .value {
@@ -384,6 +474,16 @@ onUnmounted(() => {
 
 .concentration .value.alert {
   color: #f85149;
+}
+
+.concentration .value.faulty {
+  color: #f85149;
+  font-size: 13px;
+}
+
+.concentration .value.stale {
+  color: #ffa41c;
+  font-size: 13px;
 }
 
 .concentration .value.loading {
@@ -398,6 +498,12 @@ onUnmounted(() => {
 .concentration .threshold {
   font-size: 10px;
   color: #6e7681;
+}
+
+.fault-hint, .stale-hint {
+  font-size: 10px;
+  color: #8b949e;
+  margin-left: 4px;
 }
 
 .sensor-progress {
@@ -423,6 +529,40 @@ onUnmounted(() => {
 
 .progress-bar.alert {
   background: #f85149;
+}
+
+.progress-bar.faulty {
+  background: repeating-linear-gradient(
+    90deg,
+    #8b949e,
+    #8b949e 4px,
+    #6e7681 4px,
+    #6e7681 8px
+  );
+}
+
+.progress-bar.stale {
+  background: #6e7681;
+  opacity: 0.5;
+}
+
+.fault-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: rgba(248, 81, 73, 0.95);
+  color: white;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 0 0 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.fault-icon {
+  font-size: 10px;
 }
 
 .empty-state {

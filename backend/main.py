@@ -208,6 +208,16 @@ async def generate_sse_data(
                 
                 heatmap_data = []
                 for d in filtered:
+                    health = d.get("health_status", "healthy")
+                    if health == "faulty":
+                        status = "faulty"
+                    elif health == "stale":
+                        status = "stale"
+                    elif d["avg_concentration"] > d["threshold"]:
+                        status = "alert"
+                    else:
+                        status = "normal"
+                    
                     heatmap_data.append({
                         "x": d["x"],
                         "y": d["y"],
@@ -217,7 +227,10 @@ async def generate_sse_data(
                         "gas_type": d["gas_type"],
                         "threshold": d["threshold"],
                         "area": d["area"],
-                        "status": "alert" if d["avg_concentration"] > d["threshold"] else "normal"
+                        "status": status,
+                        "health_status": health,
+                        "last_seen_ms": d.get("last_seen_ms", 0),
+                        "consecutive_zeros": d.get("consecutive_zeros", 0)
                     })
                 
                 response_data = {

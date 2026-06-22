@@ -8,12 +8,17 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+STALE_THRESHOLD_SECONDS = 15
+FAULTY_ZERO_SECONDS = 30
+FAULTY_ZERO_COUNT = 25
+
 
 class InMemoryDB:
     def __init__(self):
         self.readings = defaultdict(lambda: deque(maxlen=7200))
         self.metadata = {}
         self.lock = threading.Lock()
+        self.sensor_health = {}
         self.init_database()
         self.start_simulator()
         logger.info("In-memory database initialized (for demo purposes)")
@@ -52,9 +57,17 @@ class InMemoryDB:
                             "base": gas_config["base"],
                             "variance": gas_config["variance"]
                         }
+                        self.sensor_health[key] = {
+                            "status": "healthy",
+                            "last_seen_ms": int(time.time() * 1000),
+                            "consecutive_zeros": 0,
+                            "fault_start_ms": None,
+                            "stale_start_ms": None
+                        }
                         sensor_idx += 1
         
         self.leak_sensors = set()
+        self.faulty_sensors = set()
         self._backfill_history()
 
     def _backfill_history(self, hours: int = 2):
@@ -77,12 +90,69 @@ class InMemoryDB:
         
         logger.info(f"Backfilled {len(self.metadata) * 7200} historical readings")
 
+    def _compute_health(self, key, sensor_readings, now_ms):
+        health = self.sensor_health.get(key, {
+            "status": "healthy",
+            "last_seen_ms": now_ms,
+            "consecutive_zeros": 0,
+            "fault_start_ms": None,
+            "stale_start_ms": None
+        })
+        
+        if not sensor_readings:
+            health["status"] = "stale"
+            if health["stale_start_ms"] is None:
+                health["stale_start_ms"] = now_ms
+            return health
+        
+        latest = sensor_readings[-1]
+        health["last_seen_ms"] = latest["timestamp"]
+        health["stale_start_ms"] = None
+        
+        time_since_last = now_ms - latest["timestamp"]
+        
+        if time_since_last > STALE_THRESHOLD_SECONDS * 1000:
+            health["status"] = "stale"
+            if health["stale_start_ms"] is None:
+                health["stale_start_ms"] = latest["timestamp"] + STALE_THRESHOLD_SECONDS * 1000
+            return health
+        
+        recent_count = min(len(sensor_readings), 30)
+        recent = list(sensor_readings)[-recent_count:]
+        
+        consecutive_zeros = 0
+        for r in reversed(recent):
+            if r["concentration"] == 0.0:
+                consecutive_zeros += 1
+            else:
+                break
+        health["consecutive_zeros"] = consecutive_zeros
+        
+        if consecutive_zeros >= FAULTY_ZERO_COUNT:
+            health["status"] = "faulty"
+            if health["fault_start_ms"] is None:
+                first_zero = None
+                for r in recent:
+                    if r["concentration"] == 0.0:
+                        if first_zero is None:
+                            first_zero = r["timestamp"]
+                    else:
+                        first_zero = None
+                health["fault_start_ms"] = first_zero or now_ms
+            return health
+        
+        health["status"] = "healthy"
+        health["fault_start_ms"] = None
+        return health
+
     def start_simulator(self):
         def simulator_worker():
             leak_sensor_ids = [
                 k[0] for k in self.metadata.keys() 
                 if self.metadata[k]["gas_type"] == "NH3"
             ][:8]
+            
+            faulty_pool = list(self.metadata.keys())[:15]
             
             while True:
                 cycle_start = time.time()
@@ -96,21 +166,43 @@ class InMemoryDB:
                     removed = self.leak_sensors.pop()
                     logger.info(f"✅  Leak resolved at sensor {removed}")
                 
+                if random.random() < 0.008 and len(self.faulty_sensors) < 5:
+                    fk = random.choice(faulty_pool)
+                    if fk not in self.faulty_sensors:
+                        self.faulty_sensors.add(fk)
+                        logger.error(f"🔴 Sensor FAULT: {fk[0]} ({fk[1]}) — hardware failure simulated")
+                
+                if random.random() < 0.003 and self.faulty_sensors:
+                    recovered = random.choice(list(self.faulty_sensors))
+                    self.faulty_sensors.discard(recovered)
+                    logger.info(f"🟢 Sensor RECOVERED: {recovered[0]} ({recovered[1]})")
+                
                 readings_batch = []
                 for key, meta in self.metadata.items():
+                    if "base" not in meta:
+                        continue
                     base = meta["base"]
                     variance = meta["variance"]
+                    sensor_id = meta["sensor_id"]
                     
-                    if meta["sensor_id"] in self.leak_sensors:
+                    if key in self.faulty_sensors:
+                        fault_roll = random.random()
+                        if fault_roll < 0.4:
+                            concentration = 0.0
+                        elif fault_roll < 0.6:
+                            continue
+                        else:
+                            concentration = round(random.uniform(0, base * 0.05), 4)
+                    elif sensor_id in self.leak_sensors:
                         multiplier = random.uniform(1.5, 3.0)
                         concentration = base * multiplier + random.gauss(0, variance)
                     else:
                         concentration = max(0, base + random.gauss(0, variance))
                     
                     reading = {
-                        "sensor_id": meta["sensor_id"],
+                        "sensor_id": sensor_id,
                         "gas_type": meta["gas_type"],
-                        "concentration": round(concentration, 4),
+                        "concentration": round(concentration, 4) if concentration != 0.0 else 0.0,
                         "x": meta["x"],
                         "y": meta["y"],
                         "area": meta["area"],
@@ -118,7 +210,7 @@ class InMemoryDB:
                     }
                     readings_batch.append(reading)
                     
-                    key_str = f"{meta['sensor_id']}:{meta['gas_type']}"
+                    key_str = f"{sensor_id}:{meta['gas_type']}"
                     self.readings[key_str].append({
                         "timestamp": reading["timestamp"],
                         "concentration": reading["concentration"]
@@ -147,6 +239,13 @@ class InMemoryDB:
                 "area": area,
                 "threshold": 25.0,
                 "unit": "PPM"
+            }
+            self.sensor_health[key] = {
+                "status": "healthy",
+                "last_seen_ms": timestamp,
+                "consecutive_zeros": 0,
+                "fault_start_ms": None,
+                "stale_start_ms": None
             }
         
         key_str = f"{sensor_id}:{gas_type}"
@@ -177,6 +276,7 @@ class InMemoryDB:
 
     def get_aggregated_data(self, window_seconds: int = 60) -> List[Dict]:
         cutoff = int(time.time() * 1000) - window_seconds * 1000
+        now_ms = int(time.time() * 1000)
         results = []
         
         with self.lock:
@@ -188,7 +288,10 @@ class InMemoryDB:
                     r for r in sensor_readings 
                     if r["timestamp"] >= cutoff
                 ]
-            
+                
+                health = self._compute_health(key, recent, now_ms)
+                self.sensor_health[key] = health
+                
                 if recent:
                     concentrations = [r["concentration"] for r in recent]
                     results.append({
@@ -200,7 +303,25 @@ class InMemoryDB:
                         "x": meta["x"],
                         "y": meta["y"],
                         "area": meta["area"],
-                        "threshold": meta["threshold"]
+                        "threshold": meta["threshold"],
+                        "health_status": health["status"],
+                        "last_seen_ms": health["last_seen_ms"],
+                        "consecutive_zeros": health["consecutive_zeros"]
+                    })
+                else:
+                    results.append({
+                        "sensor_id": meta["sensor_id"],
+                        "gas_type": meta["gas_type"],
+                        "avg_concentration": 0,
+                        "max_concentration": 0,
+                        "min_concentration": 0,
+                        "x": meta["x"],
+                        "y": meta["y"],
+                        "area": meta["area"],
+                        "threshold": meta["threshold"],
+                        "health_status": "stale",
+                        "last_seen_ms": health.get("last_seen_ms", 0),
+                        "consecutive_zeros": 0
                     })
         
         return sorted(results, key=lambda x: (x["area"], x["x"], x["y"], x["gas_type"]))
@@ -235,6 +356,7 @@ class InMemoryDB:
         return result
 
     def get_all_sensors(self) -> List[Dict]:
+        now_ms = int(time.time() * 1000)
         return sorted(
             [
                 {
@@ -244,9 +366,11 @@ class InMemoryDB:
                     "y": v["y"],
                     "area": v["area"],
                     "threshold": v["threshold"],
-                    "unit": v["unit"]
+                    "unit": v["unit"],
+                    "health_status": self.sensor_health.get(k, {}).get("status", "healthy"),
+                    "last_seen_ms": self.sensor_health.get(k, {}).get("last_seen_ms", now_ms)
                 }
-                for v in self.metadata.values()
+                for k, v in self.metadata.items()
             ],
             key=lambda x: (x["area"], x["x"], x["y"], x["gas_type"])
         )
